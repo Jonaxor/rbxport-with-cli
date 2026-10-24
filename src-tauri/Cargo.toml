@@ -5,10 +5,15 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 description = "Rekordbox-compatible export-mode library manager."
+default-run = "rbxport"
 
 [lib]
 name = "rbxport_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
+
+[[bin]]
+name = "rbxport-cli"
+path = "src/bin/rbxport-cli.rs"
 
 [lints]
 workspace = true
@@ -26,6 +31,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # The daily log file (`logging.rs`), written off the calling thread.
 tracing-appender = "0.2"
@@ -65,6 +71,7 @@ sentry = { version = "0.46", default-features = false, features = ["backtrace", 
 
 zip = { version = "4.6.1", default-features = false, features = ["deflate"] }
 tempfile = "3"
+dialoguer = { version = "0.11", default-features = true }
 
 [dev-dependencies]
 rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl"] }
