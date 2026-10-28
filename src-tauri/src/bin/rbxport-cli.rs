@@ -1143,4 +1143,63 @@ mod tests {
 
         let _ = fs::remove_dir_all(base);
     }
+
+    #[test]
+    fn parse_relocate_defaults_to_dry_run_and_flags_split() {
+        let parsed = super::parse_args_from(vec![
+            "relocate".to_owned(),
+            "/tmp/stick".to_owned(),
+        ])
+        .unwrap();
+        match parsed {
+            super::Command::Relocate { roots, case_insensitive, apply } => {
+                assert!(!case_insensitive && !apply && roots == vec![PathBuf::from("/tmp/stick")]);
+            }
+            _ => panic!("wrong command"),
+        }
+
+        let parsed = super::parse_args_from(vec![
+            "relocate".to_owned(),
+            "/tmp/a".to_owned(),
+            "/tmp/b".to_owned(),
+            "--case-insensitive".to_owned(),
+            "--apply".to_owned(),
+        ])
+        .unwrap();
+        match parsed {
+            super::Command::Relocate { roots, case_insensitive, apply } => {
+                assert!(case_insensitive && apply);
+                assert_eq!(roots.len(), 2);
+            }
+            _ => panic!("wrong command"),
+        }
+
+        assert!(super::parse_args_from(vec!["relocate".to_owned(), "--apply".to_owned()]).is_err());
+    }
+
+    #[test]
+    fn file_name_index_matches_exactly_then_folded() {
+        let base = std::env::temp_dir().join(format!(
+            "rbxport-cli-relocate-test-{}",
+            SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let nested = base.join("playlist/songs");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(nested.join("Song, the-Remix.MP3"), b"x").unwrap();
+        fs::write(base.join("other.mp3"), b"x").unwrap();
+
+        let index = super::FileNameIndex::build(&base).unwrap();
+        // Exact name wins on its own.
+        assert_eq!(index.find("Song, the-Remix.MP3", false), Some(nested.join("Song, the-Remix.MP3")));
+        // Folded search finds it when only the installed spelling differs.
+        assert!(matches!(
+            index.find("song, the-remix.mp3", true),
+            Some(found) if found.ends_with("Song, the-Remix.MP3")
+        ));
+        // ...and plain case differences are not matches when the run is exact.
+        assert_eq!(index.find("song, the-remix.mp3", false), None);
+        assert_eq!(index.find("absent.mp3", true), None);
+
+        let _ = fs::remove_dir_all(base);
+    }
 }
