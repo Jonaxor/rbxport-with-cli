@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -21,6 +22,89 @@ enum Command {
     Export { destination: Option<PathBuf>, playlists: Vec<String>, eject: bool },
     Reset { force: bool },
     Node { kind: NodeKind, action: NodeAction },
+    Relocate { roots: Vec<PathBuf>, case_insensitive: bool, apply: bool },
+}
+
+/// Every file under `folder`, the first path met for each name, walked
+/// depth-first with links to folders followed once (by device and inode).
+/// A copy of the Missing File Manager's `Walks` walk; kept here so the CLI
+/// works case-insensitively, which the GUI's exact-name map cannot.
+struct FileNameIndex {
+    exact: HashMap<String, PathBuf>,
+    folded: HashMap<String, PathBuf>,
+    files_seen: usize,
+}
+
+impl FileNameIndex {
+    fn new() -> Self {
+        Self { exact: HashMap::new(), folded: HashMap::new(), files_seen: 0 }
+    }
+
+    fn build(folder: &Path) -> Result<Self, String> {
+        if !folder.is_dir() {
+            return Err(format!("{} is not a directory", folder.display()));
+        }
+        let mut index = Self::new();
+        let mut seen: HashSet<(u64, u64)> = HashSet::new();
+        index.walk(folder, &mut seen);
+        Ok(index)
+    }
+
+    fn walk(&mut self, dir: &Path, seen: &mut HashSet<(u64, u64)>) {
+        // The run's folder mark: device and inode where the platform gives
+        // them, a path hash where it does not. Metadata follows links, so a
+        // linked folder is met as its target — visited once.
+        let Some(key) = visit_key(dir) else { return };
+        if !seen.insert(key) {
+            return;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else { return };
+        for entry in entries.flatten() {
+            let Ok(kind) = entry.file_type() else { continue };
+            let path = entry.path();
+            if kind.is_symlink() {
+                // Linked folders are walked once; linked files are not
+                // indexed, as the GUI's walk does not either.
+                if let Ok(target) = std::fs::metadata(&path) {
+                    if target.is_dir() {
+                        self.walk(&path, seen);
+                    }
+                }
+                continue;
+            }
+            if kind.is_dir() {
+                self.walk(&path, seen);
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            self.folded.entry(name.to_lowercase()).or_insert_with(|| path.clone());
+            self.exact.entry(name).or_insert(path);
+            self.files_seen += 1;
+        }
+    }
+
+    /// The first file called `name`, the run's exact match winning over the
+    /// folded one.
+    fn find(&self, name: &str, case_insensitive: bool) -> Option<PathBuf> {
+        self.exact.get(name).cloned().or_else(|| {
+            case_insensitive.then(|| self.folded.get(&name.to_lowercase()).cloned()).flatten()
+        })
+    }
+}
+
+#[cfg(unix)]
+fn visit_key(path: &Path) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn visit_key(path: &Path) -> Option<(u64, u64)> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    path.hash(&mut hasher);
+    Some((0, hasher.finish()))
 }
 
 fn usage() -> String {
@@ -36,6 +120,7 @@ fn usage() -> String {
         "  rbxport-cli playlist delete <id>\n",
         "  rbxport-cli folder add <name> [parent]\n",
         "  rbxport-cli folder delete <id>\n",
+        "  rbxport-cli relocate <search-dir> [<search-dir> ...] [--case-insensitive] [--apply]\n",
         "  rbxport-cli --help\n",
         "\n",
         "Notes:\n",
@@ -46,6 +131,9 @@ fn usage() -> String {
         "  - Reset removes all live songs, playlists and folders after a --force confirmation.\n",
         "  - Playlist and folder actions match the GUI's write semantics.\n",
         "  - Export validates the destination before writing and can eject the USB with --eject.\n",
+        "  - Relocate searches the given dirs (recursively) for each missing track's file.\n",
+        "    Matches by exact file name first, optionally case-insensitively. Prints a plan;\n",
+        "    nothing is written until --apply is given.\n",
     )
     .to_owned()
 }
@@ -159,6 +247,26 @@ where
         }
         "playlist" => parse_node_action(NodeKind::Playlist, &mut args),
         "folder" => parse_node_action(NodeKind::Folder, &mut args),
+        "relocate" => {
+            let mut roots = Vec::new();
+            let mut case_insensitive = false;
+            let mut apply = false;
+            for arg in args {
+                match arg.as_str() {
+                    "--case-insensitive" | "-i" => case_insensitive = true,
+                    "--apply" | "--write" => apply = true,
+                    "--dry-run" => apply = false,
+                    value if value.starts_with('-') => {
+                        return Err(format!("{}\nError: unknown relocate flag '{value}'.", usage()));
+                    }
+                    value => roots.push(PathBuf::from(value)),
+                }
+            }
+            if roots.is_empty() {
+                return Err(format!("{}\nError: relocate requires at least one search directory.", usage()));
+            }
+            Ok(Command::Relocate { roots, case_insensitive, apply })
+        }
         _ => Err(format!("{}\nError: unknown command '{command}'.", usage())),
     }
 }
@@ -462,8 +570,149 @@ fn cmd_reset(force: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_node(kind: NodeKind, action: NodeAction) -> Result<(), String> {
+/// Point missing tracks at files found under the search dirs, rekordbox's
+/// Auto Relocate does: the tracks' stored `FileNameL` is looked up in
+/// indexes of the roots, each found file given to one track only, and files
+/// that are already tracks in the collection left alone. Nothing is written
+/// unless `apply` is set.
+fn cmd_relocate(roots: &[PathBuf], case_insensitive: bool, apply: bool) -> Result<(), String> {
     let location = detect_library()?;
+    let db = rbl_db::Library::open(location.clone(), rbl_db::OpenMode::ReadOnly)
+        .map_err(|error| format!("Could not open the library: {error}"))?;
+    let (library, _) = rbl_index::load(&db)
+        .map_err(|error| format!("Could not index the library: {error}"))?;
+
+    // The missing tracks, missing afresh: a path the store holds and the
+    // disk does not.
+    let mut wanted = Vec::new();
+    for index in 0..library.len() {
+        let path = library.folder_path.get(index);
+        if path.is_empty() || Path::new(path).exists() {
+            continue;
+        }
+        let stored = library.file_name.get(index);
+        let name = if stored.is_empty() {
+            Path::new(path)
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .ok_or_else(|| format!("Track {} has no file name to search for", library.ids[index]))?
+        } else {
+            stored.to_owned()
+        };
+        wanted.push((library.ids[index].to_string(), path.to_owned(), name, library.title.get(index).to_owned()));
+    }
+
+    if wanted.is_empty() {
+        println!("No missing tracks; nothing to relocate.");
+        return Ok(());
+    }
+    println!("{} missing track(s) in the library.", wanted.len());
+
+    let mut indexes = Vec::new();
+    for root in roots {
+        let index = FileNameIndex::build(root)
+            .map_err(|error| format!("Search folder unusable: {error}"))?;
+        println!("Searched {}: {} file(s)", root.display(), index.files_seen);
+        indexes.push(index);
+    }
+
+    let mut moves = Vec::new();
+    // The file each row is to point at, and the file name that won it.
+    // Redirecting a track never changes the song: rows sharing a stored
+    // path, or rows across library generations giving the file a different
+    // stored directory, are duplicates of one song and all take the file.
+    // Only a *different* file name reaching the same file is a real
+    // conflict — two different songs must not share one audio file.
+    let mut claimed: HashMap<PathBuf, String> = HashMap::new();
+    let mut in_collection: Vec<PathBuf> = Vec::new();
+    let mut conflicts: Vec<(String, PathBuf, String)> = Vec::new();
+    let mut unresolved = 0_usize;
+    for (id, old_path, name, title) in &wanted {
+        let mut found = None;
+        for index in &indexes {
+            if let Some(path) = index.find(name, case_insensitive) {
+                found = Some(path);
+                break;
+            }
+        }
+        let Some(found) = found else {
+            unresolved += 1;
+            println!("  unresolved: {title} ({old_path})");
+            continue;
+        };
+        if library.row_for_path(&found).is_some() {
+            in_collection.push(found.clone());
+            println!("  in the collection already: {}", found.display());
+            continue;
+        }
+        if let Some(winner_name) = claimed.get(&found) {
+            if winner_name != name {
+                conflicts.push((id.clone(), found.clone(), old_path.clone()));
+                continue;
+            }
+        } else {
+            claimed.insert(found.clone(), name.clone());
+        }
+        moves.push((id.clone(), found, old_path.clone(), title.clone()));
+    }
+
+    println!();
+    println!("{} move(s) planned, {unresolved} unresolved, {} already in the collection, {} conflicts.",
+        moves.len(), in_collection.len(), conflicts.len());
+    for (id, path, old_path, title) in &moves {
+        println!("  {id} {title}: {old_path}");
+        println!("      -> {}", path.display());
+    }
+
+    if !conflicts.is_empty() {
+        println!();
+        println!("{} file(s) matched more than one missing track; only the first got each:", conflicts.len());
+        for (id, found, old_path) in conflicts.iter().take(100) {
+            println!("  {id} {old_path} -> skipped, {}", found.display());
+        }
+    }
+    if !apply {
+        println!();
+        println!("Dry run: the library was not changed. Re-run with --apply to write these paths.");
+        return Ok(());
+    }
+
+    if moves.is_empty() {
+        println!("Nothing to write.");
+        return Ok(());
+    }
+
+    let backup_dir = std::env::temp_dir().join("rbxport-cli-backups");
+    if !backup_dir.exists() {
+        std::fs::create_dir_all(&backup_dir)
+            .map_err(|error| format!("Could not create backup dir: {error}"))?;
+    }
+    // The writer's automatic first-write copy of the library stays on: this
+    // edits every row at once, so the pre-change db is worth the disk.
+    let mut writer = rbl_db::write::Writer::open(location, &backup_dir)
+        .map_err(|error| format!("Could not open the library for writing (is rekordbox or rbxport running?): {error}"))?;
+
+    let mut done = 0_usize;
+    let mut failed = 0_usize;
+    for (id, path, old_path, title) in &moves {
+        match writer.relocate(id, path) {
+            Ok(_) => {
+                done += 1;
+                println!("  moved {id} {title}: {}", path.display());
+            }
+            Err(error) => {
+                failed += 1;
+                eprintln!("  failed {id} {old_path}: {error}");
+            }
+        }
+    }
+    println!();
+    println!("Relocated {done} track(s); {failed} failed. The old library was backed up to {}.", backup_dir.display());
+
+    Ok(())
+}
+
+fn cmd_node(kind: NodeKind, action: NodeAction) -> Result<(), String> {    let location = detect_library()?;
     let backup_dir = std::env::temp_dir().join("rbxport-cli-backups");
     if !backup_dir.exists() {
         std::fs::create_dir_all(&backup_dir)
@@ -770,6 +1019,7 @@ fn main() {
         Command::Export { destination, playlists, eject } => cmd_export(&destination, &playlists, eject),
         Command::Reset { force } => cmd_reset(force),
         Command::Node { kind, action } => cmd_node(kind, action),
+        Command::Relocate { roots, case_insensitive, apply } => cmd_relocate(&roots, case_insensitive, apply),
     };
 
     if let Err(error) = result {
